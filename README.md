@@ -1,1 +1,1 @@
-# CH_CAC_RNAseq
+# R code for RNA-sequencing analysis (CH-CAC)
