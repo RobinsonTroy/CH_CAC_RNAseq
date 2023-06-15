@@ -1,0 +1,324 @@
+---
+title: "CH/CAC Manuscript RNAseq Analysis"
+author: "Troy Robinson"
+date: '2022-12-15'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+setwd("/Users/robinst1/Desktop/MSKCC/Levine_Lab/Data/R/Guryanova_RNA_seq")
+```
+
+Load the required packages
+```{r, message=FALSE}
+library("tidyverse")
+library("ggplot2")
+library("reshape2")
+library("DESeq2")
+library("RColorBrewer")
+library("matrixStats")
+library("scales")
+library("gridExtra")
+library("lattice")
+library("marray")
+library("gplots")
+library("readxl")
+library("pheatmap")
+library("ggrepel")
+library("EnhancedVolcano")
+library("gridExtra")
+library("fgsea")
+library("msigdbr")
+library("biomaRt")
+```
+
+Load in the count matrix (cts) and sample information sheet (coldata)
+```{r}
+cts <- as.matrix(read.csv("GE4053-counts.csv",sep="\t",row.names="X"))
+coldata <- read_xlsx("Pheno.xlsx")
+```
+
+Ensure that the data are formatted properly before running DESeq
+```{r}
+coldata <- coldata %>% column_to_rownames(., var = "Sample")
+coldata$Condition <- factor(coldata$Condition)
+
+#make sure rows and columns of the two important data frames are in the same order
+all(rownames(coldata) %in% colnames(cts)) #TRUE
+
+cts <- cts[, rownames(coldata)] #set columns and rows to be in the same order
+  all(rownames(coldata) == colnames(cts)) #TRUE
+
+```
+
+Construct a DESeqDataSet
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ Condition) 
+
+dds$Condition <- relevel(dds$Condition, ref= "Wild_Type") #set the wild-type samples as the control group
+```
+
+Run DESeq 
+```{r}
+dds <- DESeq(dds)
+dds <- dds[rowSums(counts(dds))>5,] #removing rows where the sum of counts in is 5 or fewer
+results <- results(dds)
+summary(results)
+
+```
+
+Log fold change shrinkage for visualization and ranking
+```{r}
+
+resLFC <- lfcShrink(dds, coef="Condition_Knockout_vs_Wild_Type", type="apeglm")      
+
+```
+
+View DEGs with MA plot
+```{r, fig.height=6, fig.width=9}
+DESeq2::plotMA(resLFC, ylim=c(-2,2))
+
+```
+
+Perform data transformations
+```{r}
+
+vsd <- vst(dds) #variance stabilizing transformation
+rld <- rlog(dds) #regularized logarithm
+norm_counts_ensembl <- counts(dds,normalized=TRUE) #normalized counts
+
+```
+
+Generate a PCA plot to assess clustering
+```{r, fig.height=6, fig.width=9}
+ plotPCA(vsd, intgroup=c("Condition"))+
+         scale_color_manual(values = c('black', 'red3'))+
+            geom_point(size=5)+
+              theme_bw()+
+              theme(axis.text.x = element_text( vjust = 0.5, hjust=1),
+              text=element_text(size=15,face="bold"))                                       
+
+```
+
+
+Next we'll explore the data to look at differentially expressed genes
+
+Pull ensembl gene IDs and gene names from mus musculus ensembl mart
+```{r}
+norm_counts_ensembl_df<- as.data.frame(norm_counts_ensembl) %>% rownames_to_column(., var = "ensembl_gene_id")
+
+ensembl<- useMart("ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl")
+
+gene_symbol<- getBM(attributes = c('ensembl_gene_id', #retrieve gene symbols from biomart
+                    'external_gene_name'),
+          filters = 'ensembl_gene_id',
+          values = norm_counts_ensembl_df,
+          mart= ensembl)
+
+```
+
+Set filters for number of counts, FDR, and LFC
+```{r}
+base_mean_cutoff <- 15  #mean number of counts across samples
+FDR_cutoff <- 0.05  #5% FDR cutoff
+Up_LFC_cutoff<- 1
+Down_LFC_cutoff<- -1
+
+results_df<- as.data.frame(results)  %>% rownames_to_column(., var = "ensembl_gene_id") 
+```
+
+Apply filters to identify significantly upregulated/downregulated genes
+```{r}
+results_gene<- full_join(results_df, gene_symbol, by="ensembl_gene_id")  #join gene symbol df with results
+    results_gene$padj <- ifelse(is.na(results_gene$padj), 1, results_gene$padj)
+    results_gene$pvalue <- ifelse(is.na(results_gene$pvalue), 1, results_gene$pvalue)
+
+
+#calculate how many genes have adjusted p values <0.05, removing NAs
+sum(results_gene$padj <0.05, na.rm = TRUE)
+
+#apply cutoffs to identify significantly upregulated and downregulated genes
+upregulated_genes<- results_gene[results_gene$baseMean>base_mean_cutoff&
+                                        results_gene$padj<FDR_cutoff&
+                                        results_gene$log2FoldChange>Up_LFC_cutoff,]
+
+downregulated_genes<- results_gene[results_gene$baseMean>base_mean_cutoff&
+                                          results_gene$padj<FDR_cutoff&
+                                          results_gene$log2FoldChange<Down_LFC_cutoff,]
+
+
+dim(upregulated_genes)
+dim(downregulated_genes)
+
+
+alll<- results_gene %>% dplyr::filter(padj <0.05)
+
+#write.table(upregulated_genes, file = "upregulated_genes.txt", sep = "\t",
+          #  row.names = TRUE, col.names = NA)
+
+#write.table(downregulated_genes, file = "downregulated_genes.txt", sep = "\t",
+          #  row.names = TRUE, col.names = NA)
+
+```
+
+
+
+Generate a volcano plot to visualize highly significant DEGs 
+```{r}
+keyvals <- ifelse(results_gene$log2FoldChange < -1.0 & results_gene$padj<0.05, 'lightskyblue',
+        ifelse(results_gene$log2FoldChange > 1.0 &results_gene$padj<0.05, 'red2','gray'))
+
+keyvals[is.na(keyvals)] <- 'gray'
+names(keyvals)[keyvals == 'red2'] <- 'Up: 241 genes'
+names(keyvals)[keyvals == 'lightskyblue'] <- 'Down: 56 genes'
+names(keyvals)[keyvals == 'gray'] <- 'NS'
+
+#highlight genes on volcano plot
+top_up<- c("Irx4","Gabra4","Sox17","Tlx2", "Abcc2")
+top_down<- c("Sult1d1","Upk1a", "Ybx2", "Gm3336")    
+
+```
+    
+```{r, fig.height=6, fig.width=9}
+    EnhancedVolcano(results_gene,
+                       lab= results_gene$external_gene_name,
+                       selectLab = c(top_up, top_down),
+                       x= 'log2FoldChange',
+                       y = 'padj',
+                       title= 'Dnmt3a +/- versus Wild Type',
+                       titleLabSize = 16,
+                       subtitle = "",
+                       caption = bquote(~(Log[2]~ "fold change cutoff, 1; adjusted p-val cutoff, 0.05")),
+                       ylab= (bquote(~-Log[10]~(adjusted~italic(P)))),                
+                       ylim = c(0,9),
+                       xlim = c(-10, 10),
+                       pCutoff = 0.05,
+                       FCcutoff = 1,
+                       colCustom = keyvals,
+                       labCol = 'black',
+                       labFace = 'bold',
+                       legendLabels=c('Up: 241 genes','Down: 56 genes','NS'),
+                       legendPosition = 'right'
+                    )
+
+```
+
+Hallmark pathway analysis (all)
+```{r}
+results_stat<- results_gene %>%  #omit NAs and group the test statistic and gene symbols-- stat = wald stat = log-fold change/standard error 
+                dplyr::select(external_gene_name, stat) %>%  #wald stat is used to calculate p-values
+                na.omit()
+
+ranks<- deframe(results_stat) #this converts 2-column df into a a list (name, value)
+
+hallmark_gene_sets<- msigdbr(species = "Mus musculus", category = "H" ) #hallmark gene set
+                
+hallmark_mus_gene_sets<- split(x=hallmark_gene_sets$gene_symbol, f= hallmark_gene_sets$gs_name) #prepare for fgsea
+                
+fgseaRes_hallmark <- fgsea(pathways=hallmark_mus_gene_sets, stats=ranks) #perform fgsea
+
+fgseaResTidy <- fgseaRes_hallmark %>% #gather results into a table, descending NES
+  as_tibble() %>%
+  arrange(desc(NES))                
+                
+ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  scale_fill_manual(values = c('gray', 'red'))+
+  labs(x="", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()+
+  theme(axis.text.x = element_text( vjust = 0.5, hjust=1, size=12),
+        axis.text.y = element_text(size = 6),
+        text=element_text(size=12,face="bold")) 
+
+```
+
+Hallmark pathway analysis (significant only)
+```{r}
+fgseaResTidy_H_sig <- fgseaResTidy[fgseaResTidy$padj<0.05,]
+
+ggplot(fgseaResTidy_H_sig, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  scale_fill_manual(values = c('red3'))+
+  labs(x="", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()+
+  theme(axis.text.x = element_text( vjust = 0.5, hjust=1, size=10),
+        text=element_text(size=10,face="bold")) 
+
+```
+
+```{r}
+vsd_df<- as.data.frame(assay(vsd)) %>% rownames_to_column("ensembl_gene_id") #create dataframe from VSD DESeq object
+    
+    vsd_genes<-full_join(vsd_df,gene_symbol, by="ensembl_gene_id" )
+    vsd_genes<- vsd_genes[,c(9,2:8)]
+        names(vsd_genes)[names(vsd_genes) == "BMT18.1.genes.results"] <- "BMT18.1.WT"
+        names(vsd_genes)[names(vsd_genes) == "BMT18.13.genes.results"] <- "BMT18.13.WT"
+        names(vsd_genes)[names(vsd_genes) == "BMT8.49.genes.results"] <- "BMT8.49.WT"
+        names(vsd_genes)[names(vsd_genes) == "BMT8.50.2.genes.results"] <- "BMT8.50.2.KO"
+        names(vsd_genes)[names(vsd_genes) == "BMT18.20.genes.results"] <- "BMT18.20.KO"
+        names(vsd_genes)[names(vsd_genes) == "BMT18.8.2.genes.results"] <- "BMT18.8.2.KO"
+        names(vsd_genes)[names(vsd_genes) == "BMT8.53.2.genes.results"] <- "BMT8.53.2.KO"
+```
+
+Subset data for DEGs involved in WNT/bCat signaling
+```{r}
+hallmark_WNT_bcat<- subset(fgseaResTidy_H_sig, pathway == "HALLMARK_WNT_BETA_CATENIN_SIGNALING")
+hallmark_WNT_bcat_genes<-unlist(hallmark_WNT_bcat$leadingEdge)
+
+norm_hallmark_WNT_bcat<- as.data.frame(subset(vsd_genes, external_gene_name %in% hallmark_WNT_bcat_genes)) 
+                          row.names(norm_hallmark_WNT_bcat)<- norm_hallmark_WNT_bcat$external_gene_name
+                          norm_hallmark_WNT_bcat<- norm_hallmark_WNT_bcat[,-c(1)] 
+  
+  
+norm_hal_WNTbcat_ordered<- norm_hallmark_WNT_bcat[,c("BMT18.1.WT","BMT18.13.WT","BMT8.49.WT",
+                                              "BMT18.20.KO","BMT8.50.2.KO", "BMT8.53.2.KO","BMT18.8.2.KO")] 
+  
+```
+
+Visualize differential expression of these WNT/bCat genes
+```{r}
+pheatmap(mat = norm_hal_WNTbcat_ordered,
+        scale = "row",
+        drop_levels = TRUE,
+        fontsize_row  = 12,
+        fontsize_col =12,
+        cellwidth = 30,
+        border_color=FALSE,
+        clustering_method = "complete",
+        cluster_cols = F,
+        main = "HALLMARK_WNT_BETA_CATENIN",
+        color = colorRampPalette(c("navy", "white", "red3"))(50))
+
+```
+
+View up/down signatures in the dataset
+```{r}
+
+plotEnrichment(hallmark_mus_gene_sets[["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]],
+              ranks) + labs(title="HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION")
+
+plotEnrichment(hallmark_mus_gene_sets[["HALLMARK_ANGIOGENESIS"]],
+                                 ranks, gseaParam = 0.5) + labs(title="HALLMARK_ANGIOGENESIS")
+                  
+plotEnrichment(hallmark_mus_gene_sets[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]],
+              ranks, gseaParam = 0.5) + labs(title="HALLMARK_OXIDATIVE_PHOSPHORYLATION")
+
+plotEnrichment(hallmark_mus_gene_sets[["HALLMARK_WNT_BETA_CATENIN_SIGNALING"]],
+              ranks) + labs(title="HALLMARK_WNT_BETA_CATENIN_SIGNALING")
+                  
+```
+
+
+
+
+
+
+
